@@ -173,11 +173,21 @@ with st.sidebar:
     
     st.markdown("### 🗑️ Zone")
     if st.button("Clear Database", type="secondary"):
-        clear_data("scraped_books")
-        clear_data("scraped_quotes")
-        clear_data("scraped_jobs")
-        st.toast("Database cleared successfully!", icon="🗑️")
-        st.rerun()
+        st.session_state['show_confirm'] = True
+        
+    if st.session_state.get('show_confirm'):
+        st.warning("⚠️ Are you sure? This will delete all scraped data.")
+        c1, c2 = st.columns([1,1])
+        if c1.button("Yes, Delete All", type="primary", use_container_width=True):
+            clear_data("scraped_books")
+            clear_data("scraped_quotes")
+            clear_data("scraped_jobs")
+            st.toast("Database cleared successfully!", icon="🗑️")
+            st.session_state['show_confirm'] = False
+            st.rerun()
+        if c2.button("Cancel", use_container_width=True):
+            st.session_state['show_confirm'] = False
+            st.rerun()
 
 # --- APPLY CSS ---
 st.markdown(get_custom_css(theme_choice), unsafe_allow_html=True)

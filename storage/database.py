@@ -15,12 +15,14 @@ except KeyError:
 
 DB_NAME = "data_pipeline"
 
+@st.cache_resource
 def get_db():
     """Connect to MongoDB and return the database object."""
     # ca=certifi.where() is often needed for SSL handshake on some networks/clouds
     client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
     return client[DB_NAME]
 
+@st.cache_resource
 def init_db():
     """
     Initialize MongoDB collections with indexes.
@@ -86,6 +88,7 @@ def save_data(df, collection_name):
         except Exception as e:
             print(f"Error saving to {collection_name}: {e}")
 
+@st.cache_data(ttl=60)
 def load_data(collection_name):
     """Load data from a MongoDB collection into a pandas DataFrame."""
     db = get_db()
