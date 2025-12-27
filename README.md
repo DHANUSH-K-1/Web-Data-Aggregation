@@ -63,8 +63,8 @@ Follow these steps to get the application running on your local machine.
 
 1.  **Clone the repository**
     ```bash
-    git clone https://github.com/yourusername/web-data-aggregator.git
-    cd web-data-aggregator
+    git clone git@github.com:DHANUSH-K-1/Web-Data-Aggregation.git
+    cd Web-Data-Aggregation
     ```
 
 2.  **Install Dependencies**
