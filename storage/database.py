@@ -1,135 +1,209 @@
 import pandas as pd
 import streamlit as st
-from pymongo import MongoClient, UpdateOne
-import certifi
+import sqlite3
+import os
+from datetime import datetime
 
-# Try to get the URI from Streamlit secrets, or default to localhost for local dev if not set
-try:
-    # Adding ?retryWrites=true&w=majority for Atlas stability
-    MONGO_URI = st.secrets["MONGO_URI"]
-except FileNotFoundError:
-    # Fallback for local testing if secrets.toml is missing (User should configure this)
-    MONGO_URI = "mongodb://localhost:27017/" 
-except KeyError:
-     MONGO_URI = "mongodb://localhost:27017/"
+# Path to the SQLite database
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.path.join(BASE_DIR, "data_pipeline.db")
+DB_NAME = "SQLite (data_pipeline.db)"
 
-DB_NAME = "data_pipeline"
-
-@st.cache_resource
 def get_db():
-    """Connect to MongoDB and return the database object."""
-    # ca=certifi.where() is often needed for SSL handshake on some networks/clouds
-    client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
-    return client[DB_NAME]
+    """Connect to SQLite and return the connection object."""
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 @st.cache_resource
 def init_db():
     """
-    Initialize MongoDB collections with indexes.
-    MongoDB creates databases/collections on first write, but indexes should be explicit.
+    Initialize SQLite database tables with appropriate schemas.
     """
-    db = get_db()
-    
-    # Create unique indexes to prevent duplicates (acting like Primary Keys)
     try:
-        db.scraped_books.create_index("title", unique=True)
-        db.scraped_quotes.create_index("text", unique=True)
-        # Compound index for jobs
-        db.scraped_jobs.create_index([("title", 1), ("company", 1), ("location", 1)], unique=True)
-        print("MongoDB Indexes initialized.")
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS scraped_books (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT UNIQUE,
+                    price REAL,
+                    rating TEXT,
+                    availability TEXT,
+                    scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS scraped_quotes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    text TEXT UNIQUE,
+                    author TEXT,
+                    tags TEXT,
+                    scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS scraped_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT,
+                    company TEXT,
+                    location TEXT,
+                    date_posted TEXT,
+                    scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(title, company, location)
+                )
+            """)
+            conn.commit()
+        print("SQLite Database initialized.")
     except Exception as e:
-        print(f"Index initialization warning: {e}")
+        print(f"Database initialization warning: {e}")
 
 def save_data(df, collection_name):
     """
-    Save a pandas DataFrame to the specified MongoDB collection, avoiding duplicates via Upsert.
+    Save a pandas DataFrame to the specified SQLite table, avoiding duplicates via INSERT OR REPLACE.
     """
     if df.empty:
         print(f"No data to save to {collection_name}")
         return
 
-    db = get_db()
-    collection = db[collection_name]
-    
-    # Convert DataFrame to list of dicts
-    records = df.to_dict("records")
-    
-    operations = []
-    
-    for record in records:
-        # Define unique query based on collection
-        if collection_name == 'scraped_books':
-            query = {"title": record['title']}
-        elif collection_name == 'scraped_quotes':
-            query = {"text": record['text']}
-        elif collection_name == 'scraped_jobs':
-            query = {
-                "title": record['title'],
-                "company": record['company'],
-                "location": record['location']
-            }
-        else:
-            # Fallback for unknown tables (just insert, no check?) 
-            # Better to default to something safe or skip
-            continue
+    # Add scraped_at if missing
+    df = df.copy()
+    if 'scraped_at' not in df.columns:
+        df['scraped_at'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    else:
+        df['scraped_at'] = df['scraped_at'].apply(
+            lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if hasattr(x, 'strftime') else str(x)
+        )
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            # Fetch target table schema to filter columns
+            cursor.execute(f"PRAGMA table_info({collection_name})")
+            table_cols = {row[1] for row in cursor.fetchall()}
             
-        # Add scrape timestamp if not present (handled by DB default in SQL, explicit here)
-        if 'scraped_at' not in record:
-            from datetime import datetime
-            record['scraped_at'] = datetime.utcnow()
+            # Filter DataFrame columns to only match schema (excluding autoincrement ID)
+            columns = [c for c in df.columns if c in table_cols and c != 'id']
+            if not columns:
+                print(f"No matching columns to save to {collection_name}")
+                return
+
+            placeholders = ", ".join(["?"] * len(columns))
+            col_names = ", ".join(columns)
             
-        # UpdateOne with upsert=True replaces existing or inserts new
-        operations.append(UpdateOne(query, {"$set": record}, upsert=True))
-        
-    if operations:
-        try:
-            result = collection.bulk_write(operations)
-            print(f"Synced {collection_name}: {result.upserted_count} new, {result.modified_count} updated.")
-        except Exception as e:
-            print(f"Error saving to {collection_name}: {e}")
+            query = f"INSERT OR REPLACE INTO {collection_name} ({col_names}) VALUES ({placeholders})"
+            
+            records = [tuple(x) for x in df[columns].to_numpy()]
+            
+            cursor.executemany(query, records)
+            conn.commit()
+            print(f"Synced {collection_name}: {cursor.rowcount} rows inserted/replaced.")
+    except Exception as e:
+        print(f"Error saving to {collection_name}: {e}")
 
 @st.cache_data(ttl=60)
 def load_data(collection_name):
-    """Load data from a MongoDB collection into a pandas DataFrame."""
-    db = get_db()
+    """Load data from a SQLite table into a pandas DataFrame."""
     try:
-        data = list(db[collection_name].find({}, {'_id': 0})) # Exclude MongoDB's internal _id
-        return pd.DataFrame(data)
+        with sqlite3.connect(DB_PATH) as conn:
+            # Check if table exists
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{collection_name}'")
+            if not cursor.fetchone():
+                return pd.DataFrame()
+
+            df = pd.read_sql_query(f"SELECT * FROM {collection_name}", conn)
+            
+            if 'id' in df.columns:
+                df = df.drop(columns=['id'])
+                
+            # If quotes, convert tags comma-separated string back to list of strings
+            if collection_name == 'scraped_quotes' and 'tags' in df.columns:
+                df['tags'] = df['tags'].apply(
+                    lambda x: [t.strip() for t in x.split(',')] if isinstance(x, str) and x else []
+                )
+                
+            return df
     except Exception as e:
         print(f"Error loading {collection_name}: {e}")
         return pd.DataFrame()
 
 def query_data(collection_name, query, projection=None, limit=0):
     """
-    Query data from MongoDB with a specific filter.
+    Query data from SQLite with a specific filter.
     Returns a pandas DataFrame.
     """
-    db = get_db()
     try:
-        # Exclude _id by default if projection is not provided, or merge it
-        if projection:
-            if "_id" not in projection:
-                projection["_id"] = 0
-        else:
-            projection = {"_id": 0}
+        with sqlite3.connect(DB_PATH) as conn:
+            # Check if table exists
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{collection_name}'")
+            if not cursor.fetchone():
+                return pd.DataFrame()
+
+            where_clauses = []
+            params = []
             
-        cursor = db[collection_name].find(query, projection)
-        
-        if limit > 0:
-            cursor = cursor.limit(limit)
+            for key, val in query.items():
+                if isinstance(val, dict):
+                    # Handle MongoDB operators
+                    for op, op_val in val.items():
+                        if op == "$regex":
+                            where_clauses.append(f"{key} LIKE ?")
+                            params.append(f"%{op_val}%")
+                        elif op == "$options":
+                            pass
+                        elif op == "$gte":
+                            where_clauses.append(f"{key} >= ?")
+                            params.append(op_val)
+                        elif op == "$lte":
+                            where_clauses.append(f"{key} <= ?")
+                            params.append(op_val)
+                        elif op == "$gt":
+                            where_clauses.append(f"{key} > ?")
+                            params.append(op_val)
+                        elif op == "$lt":
+                            where_clauses.append(f"{key} < ?")
+                            params.append(op_val)
+                else:
+                    if key == "tags":
+                        where_clauses.append(f"{key} LIKE ?")
+                        params.append(f"%{val}%")
+                    else:
+                        where_clauses.append(f"{key} = ?")
+                        params.append(val)
+
+            where_sql = ""
+            if where_clauses:
+                where_sql = " WHERE " + " AND ".join(where_clauses)
+
+            limit_sql = ""
+            if limit > 0:
+                limit_sql = f" LIMIT {limit}"
+
+            sql_query = f"SELECT * FROM {collection_name}{where_sql}{limit_sql}"
             
-        data = list(cursor)
-        return pd.DataFrame(data)
+            df = pd.read_sql_query(sql_query, conn, params=params)
+            
+            if 'id' in df.columns:
+                df = df.drop(columns=['id'])
+                
+            if collection_name == 'scraped_quotes' and 'tags' in df.columns:
+                df['tags'] = df['tags'].apply(
+                    lambda x: [t.strip() for t in x.split(',')] if isinstance(x, str) and x else []
+                )
+
+            return df
     except Exception as e:
         print(f"Error querying {collection_name}: {e}")
         return pd.DataFrame()
 
-
 def clear_data(collection_name):
     """Clear all documents from a specific collection."""
-    db = get_db()
     try:
-        db[collection_name].delete_many({})
-        print(f"Cleared {collection_name}")
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"DELETE FROM {collection_name}")
+            conn.commit()
+            print(f"Cleared {collection_name}")
     except Exception as e:
         print(f"Error clearing {collection_name}: {e}")
+
